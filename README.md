@@ -16,7 +16,7 @@ This Python script downloads media files (images, videos, attachments) from a sp
 1.  **Install the required libraries:**
 
     ```bash
-    pip install aiohttp asyncio yarl aiolimiter beautifulsoup4
+    pip install -r requirements.txt
     ```
 
 **Usage:**

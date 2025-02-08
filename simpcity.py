@@ -3,15 +3,16 @@ import aiohttp
 import logging
 import sys
 import os
+import json
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Tuple
 from yarl import URL
 from aiolimiter import AsyncLimiter
 from bs4 import BeautifulSoup
 import re
 import getpass
 
-# Set up logging
+# Configurar logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -21,15 +22,17 @@ logger = logging.getLogger(__name__)
 
 class SimpCityDownloader:
     def __init__(self):
-        self.base_url = URL("https://simpcity.su")
+        self.base_url = URL("https://www.simpcity.su")
         self.session = None
         self.logged_in = False
         self.login_attempts = 0
-        self.request_limiter = AsyncLimiter(10, 1)  # 10 requests per second
+        self.request_limiter = AsyncLimiter(10, 1)  # 10 requests por segundo
         self.download_path = Path("downloads/simpcity")
         self.download_path.mkdir(parents=True, exist_ok=True)
+        # Ruta para guardar las cookies
+        self.cookie_file = Path("cookies.json")
         
-        # Selectors from original crawler
+        # Selectores según el crawler original
         self.title_selector = "h1[class=p-title-value]"
         self.posts_selector = "div[class*=message-main]"
         self.post_content_selector = "div[class*=message-userContent]"
@@ -39,38 +42,64 @@ class SimpCityDownloader:
         self.attachments_block_selector = "section[class=message-attachments]"
         self.attachments_selector = "a"
         self.next_page_selector = "a[class*=pageNav-jump--next]"
-    
+
     async def init_session(self):
-        """Initialize aiohttp session"""
+        """Inicializar la sesión aiohttp y cargar cookies persistentes (si existen)"""
         if not self.session:
             self.session = aiohttp.ClientSession()
-    
+            self.load_cookies()
+
     async def close(self):
-        """Close the session"""
+        """Guardar cookies y cerrar la sesión"""
         if self.session:
+            self.save_cookies()
             await self.session.close()
             self.session = None
-    
+
+    def save_cookies(self):
+        """Guarda las cookies actuales en un archivo JSON"""
+        if self.session and self.session.cookie_jar:
+            # Se obtienen las cookies para el dominio base
+            simple_cookie = self.session.cookie_jar.filter_cookies(str(self.base_url))
+            cookies = {key: morsel.value for key, morsel in simple_cookie.items()}
+            try:
+                with open(self.cookie_file, 'w') as f:
+                    json.dump(cookies, f)
+                logger.info("Cookies guardadas en %s", self.cookie_file)
+            except Exception as e:
+                logger.error("Error guardando cookies: %s", str(e))
+
+    def load_cookies(self):
+        """Carga las cookies desde el archivo (si existe) y las añade a la sesión"""
+        if self.cookie_file.exists():
+            try:
+                with open(self.cookie_file, 'r') as f:
+                    cookies = json.load(f)
+                self.session.cookie_jar.update_cookies(cookies)
+                logger.info("Cookies cargadas desde %s", self.cookie_file)
+            except Exception as e:
+                logger.error("Error cargando cookies: %s", str(e))
+
     async def check_login_required(self, url: str) -> bool:
-        """Check if login is required for the given URL"""
+        """Verifica si es necesario iniciar sesión para acceder a la URL dada"""
         try:
             async with self.session.get(url) as response:
                 if response.status == 200:
                     text = await response.text()
-                    # Check for login indicators in the response
+                    # Se buscan indicadores de login en la respuesta
                     return 'You must be logged-in to do that.' in text or 'Login or register' in text
-                return True  # Assume login required if we can't access the page
+                return True  # Asumir que es necesario login si no se puede acceder a la página
         except Exception:
-            return True  # Assume login required on error
-    
+            return True
+
     async def prompt_and_login(self) -> bool:
-        """Prompt for credentials and attempt login"""
-        print("\nLogin required for SimpCity")
-        print("1. Login with username/password")
-        print("2. Login with xf_user cookie")
-        print("3. Continue without login")
+        """Solicita las credenciales y realiza el login"""
+        print("\nLogin requerido para SimpCity")
+        print("1. Login con username/password")
+        print("2. Login con cookie xf_user")
+        print("3. Continuar sin login")
         
-        choice = input("\nEnter your choice (1-3): ").strip()
+        choice = input("\nIngrese su elección (1-3): ").strip()
         
         if choice == "1":
             username = input("Username: ").strip()
@@ -78,20 +107,20 @@ class SimpCityDownloader:
             return await self.login(username, password)
             
         elif choice == "2":
-            print("\nTo get your xf_user cookie:")
-            print("1. Login to SimpCity in your browser")
-            print("2. Open Developer Tools (F12)")
-            print("3. Go to Application/Storage -> Cookies")
-            print("4. Find and copy the 'xf_user' cookie value")
-            xf_user = input("\nEnter xf_user cookie value: ").strip()
+            print("\nPara obtener tu cookie xf_user:")
+            print("1. Ingresa a SimpCity en tu navegador")
+            print("2. Abre las herramientas de desarrollador (F12)")
+            print("3. Ve a Application/Storage -> Cookies")
+            print("4. Copia el valor de la cookie 'xf_user'")
+            xf_user = input("\nIngresa el valor de la cookie xf_user: ").strip()
             return await self.login(None, None, xf_user)
             
         else:
-            logger.warning("Continuing without authentication")
+            logger.warning("Continuando sin autenticación")
             return False
-    
+
     async def verify_login(self) -> bool:
-        """Verify if we are actually logged in by checking a profile page"""
+        """Verifica si estamos logueados comprobando la página de detalles de cuenta"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -103,17 +132,16 @@ class SimpCityDownloader:
             async with self.session.get(self.base_url / "account/account-details", headers=headers) as response:
                 if response.status != 200:
                     return False
-                
                 text = await response.text()
                 return 'You must be logged in to view this page.' not in text
         except Exception:
             return False
-    
+
     async def login(self, username: str = None, password: str = None, xf_user_cookie: str = None) -> bool:
-        """Login to SimpCity"""
+        """Inicia sesión en SimpCity a través de https://www.simpcity.su/login/ y guarda las cookies"""
         await self.init_session()
         
-        # Common headers for all requests
+        # Encabezados comunes para todas las solicitudes
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -133,94 +161,93 @@ class SimpCityDownloader:
             self.session.cookie_jar.update_cookies({'xf_user': xf_user_cookie})
             if await self.verify_login():
                 self.logged_in = True
-                logger.info("Successfully logged in using xf_user cookie")
+                logger.info("Login exitoso usando la cookie xf_user")
                 return True
             else:
-                logger.error("Login failed: Invalid or expired xf_user cookie")
+                logger.error("Login fallido: cookie xf_user inválida o expirada")
                 return False
             
         if not username or not password:
             return False
             
         try:
-            # First get the login page to get the token
+            # Primero, obtener la página de login para extraer el token CSRF y otros campos ocultos
             login_page_url = self.base_url / "login"
             headers['Referer'] = str(self.base_url)
             
             async with self.session.get(login_page_url, headers=headers) as response:
                 if response.status == 403:
-                    logger.error("Access forbidden. The site may be blocking automated access.")
-                    logger.info("Try using the xf_user cookie method instead.")
+                    logger.error("Acceso prohibido. El sitio puede estar bloqueando accesos automatizados.")
+                    logger.info("Intenta usar el método de cookie xf_user.")
                     return False
                 elif response.status != 200:
-                    logger.error(f"Failed to get login page: {response.status}")
+                    logger.error(f"Error al obtener la página de login: {response.status}")
                     return False
                     
                 text = await response.text()
                 soup = BeautifulSoup(text, 'html.parser')
                 
-                # Get CSRF token
-                csrf_token = soup.select_one('input[name=_xfToken]')
-                if not csrf_token:
-                    logger.error("Could not find CSRF token. The login page structure might have changed.")
+                # Extraer token CSRF
+                csrf_token_elem = soup.select_one('input[name=_xfToken]')
+                if not csrf_token_elem:
+                    logger.error("No se encontró el token CSRF. La estructura de la página de login pudo haber cambiado.")
                     return False
-                csrf_token = csrf_token['value']
+                csrf_token = csrf_token_elem['value']
                 
-                # Get any hidden fields that might be required
+                # Extraer campos ocultos (si los hay)
                 hidden_fields = {}
                 for hidden in soup.find_all('input', type='hidden'):
                     if hidden.get('name') and hidden.get('value'):
                         hidden_fields[hidden['name']] = hidden['value']
             
-            # Prepare login data
+            # Preparar datos para el login
             login_url = self.base_url / "login/login"
             data = {
                 'login': username,
                 'password': password,
                 '_xfToken': csrf_token,
-                '_xfRedirect': str(self.base_url),
+                '_xfRedirect': str(self.base_url),  # Se redirigirá al inicio (luego el usuario ingresa la URL deseada)
                 'remember': '1'
             }
-            # Add any additional hidden fields
             data.update(hidden_fields)
             
-            # Update headers for the login request
+            # Actualizar headers para la solicitud de login
             headers.update({
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Origin': str(self.base_url),
                 'Referer': str(login_page_url)
             })
             
-            # Attempt login
+            # Intentar el login
             async with self.session.post(login_url, data=data, headers=headers, allow_redirects=True) as response:
                 if response.status == 403:
-                    logger.error("Access forbidden during login. The site may be blocking automated access.")
-                    logger.info("Try using the xf_user cookie method instead.")
+                    logger.error("Acceso prohibido durante el login. El sitio puede estar bloqueando accesos automatizados.")
+                    logger.info("Intenta usar el método de cookie xf_user.")
                     return False
-                elif response.status not in [200, 303]:  # 303 is "See Other" redirect after successful login
-                    logger.error(f"Login failed: Unexpected status code {response.status}")
+                elif response.status not in [200, 303]:
+                    logger.error(f"Login fallido: código de estado inesperado {response.status}")
                     return False
                 
-                # Verify login status
+                # Verificar que se haya iniciado sesión
                 if await self.verify_login():
                     self.logged_in = True
-                    logger.info("Successfully logged in")
+                    logger.info("Login exitoso")
                     return True
                 
-                # If verification failed, check the response for error messages
+                # Si la verificación falla, buscar mensajes de error en la respuesta
                 text = await response.text()
                 if any(error in text.lower() for error in ['invalid password', 'invalid username', 'incorrect password']):
-                    logger.error("Invalid username or password")
+                    logger.error("Usuario o contraseña inválidos")
                 else:
-                    logger.error("Login failed: Could not verify login status")
+                    logger.error("Login fallido: no se pudo verificar el estado de autenticación")
                 return False
                     
         except Exception as e:
-            logger.error(f"Login error: {str(e)}")
+            logger.error(f"Error durante el login: {str(e)}")
             return False
-    
+
     async def get_page(self, url: URL) -> Optional[BeautifulSoup]:
-        """Get page content with rate limiting"""
+        """Obtiene el contenido de una página aplicando rate limiting"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -236,25 +263,25 @@ class SimpCityDownloader:
             try:
                 async with self.session.get(url, headers=headers) as response:
                     if response.status == 403:
-                        logger.error(f"Access forbidden for {url}. The site may be blocking automated access.")
+                        logger.error(f"Acceso prohibido para {url}. El sitio puede estar bloqueando accesos automatizados.")
                         return None
                     elif response.status != 200:
-                        logger.error(f"Failed to get page {url}: {response.status}")
+                        logger.error(f"Error al obtener la página {url}: {response.status}")
                         return None
                     text = await response.text()
                     return BeautifulSoup(text, 'html.parser')
             except Exception as e:
-                logger.error(f"Error getting page {url}: {str(e)}")
+                logger.error(f"Error al obtener la página {url}: {str(e)}")
                 return None
-    
+
     async def download_file(self, url: str, filename: str, subfolder: str = ""):
-        """Download a file with progress tracking"""
+        """Descarga un archivo mostrando el progreso"""
         save_path = self.download_path / subfolder
         save_path.mkdir(exist_ok=True)
         filepath = save_path / filename
         
         if filepath.exists():
-            logger.info(f"File already exists: {filename}")
+            logger.info(f"El archivo ya existe: {filename}")
             return True
         
         headers = {
@@ -265,15 +292,15 @@ class SimpCityDownloader:
             async with self.request_limiter:
                 async with self.session.get(url, headers=headers) as response:
                     if response.status != 200:
-                        logger.error(f"Failed to download {filename}: {response.status}")
+                        logger.error(f"Error al descargar {filename}: {response.status}")
                         return False
                     
                     file_size = int(response.headers.get('content-length', 0))
                     if file_size == 0:
-                        logger.error(f"Empty file: {filename}")
+                        logger.error(f"Archivo vacío: {filename}")
                         return False
                     
-                    logger.info(f"Downloading {filename} ({file_size/1024/1024:.1f} MB)")
+                    logger.info(f"Descargando {filename} ({file_size/1024/1024:.1f} MB)")
                     
                     temp_filepath = filepath.with_suffix('.temp')
                     try:
@@ -286,33 +313,30 @@ class SimpCityDownloader:
                                     if file_size:
                                         progress = (downloaded / file_size) * 100
                                         if downloaded % (8192 * 100) == 0:
-                                            print(f"\rProgress: {progress:.1f}%", end='', flush=True)
+                                            print(f"\rProgreso: {progress:.1f}%", end='', flush=True)
                             
-                            print()  # New line after progress
+                            print()  # Nueva línea después del progreso
                             
                         temp_filepath.replace(filepath)
-                        logger.info(f"Successfully downloaded {filename}")
+                        logger.info(f"Archivo descargado exitosamente: {filename}")
                         return True
-                        
                     except Exception as e:
                         if temp_filepath.exists():
                             temp_filepath.unlink()
                         raise e
-                        
         except Exception as e:
-            logger.error(f"Error downloading {filename}: {str(e)}")
+            logger.error(f"Error descargando {filename}: {str(e)}")
             if filepath.exists():
                 filepath.unlink()
             return False
-    
+
     async def process_post(self, post_content: BeautifulSoup, subfolder: str) -> List[Tuple[str, str]]:
-        """Process a forum post and extract media files"""
+        """Procesa un post del foro y extrae archivos multimedia"""
         files = []
-        
         try:
-            # Process images
+            # Procesar imágenes
             images = post_content.select(self.images_selector)
-            logger.debug(f"Found {len(images)} images in post")
+            logger.debug(f"Se encontraron {len(images)} imágenes en el post")
             for img in images:
                 src = img.get('src')
                 if src:
@@ -323,9 +347,9 @@ class SimpCityDownloader:
                     filename = src.split('/')[-1]
                     files.append((src, filename))
             
-            # Process videos
+            # Procesar videos
             videos = post_content.select(self.videos_selector)
-            logger.debug(f"Found {len(videos)} videos in post")
+            logger.debug(f"Se encontraron {len(videos)} videos en el post")
             for video in videos:
                 src = video.get('src')
                 if src:
@@ -336,11 +360,11 @@ class SimpCityDownloader:
                     filename = src.split('/')[-1]
                     files.append((src, filename))
             
-            # Process attachments
+            # Procesar attachments
             attachments_block = post_content.select_one(self.attachments_block_selector)
             if attachments_block:
                 attachments = attachments_block.select(self.attachments_selector)
-                logger.debug(f"Found {len(attachments)} attachments in post")
+                logger.debug(f"Se encontraron {len(attachments)} attachments en el post")
                 for attachment in attachments:
                     href = attachment.get('href')
                     if href:
@@ -352,122 +376,120 @@ class SimpCityDownloader:
                         files.append((href, filename))
             
             if files:
-                logger.debug(f"Total files found in post: {len(files)}")
-            
+                logger.debug(f"Total de archivos encontrados en el post: {len(files)}")
             return files
-            
         except Exception as e:
-            logger.error(f"Error processing post: {str(e)}")
+            logger.error(f"Error procesando post: {str(e)}")
             return []
-    
+
     async def process_thread(self, url: str) -> None:
-        """Process a forum thread and download all media"""
-        logger.info(f"Starting to process thread: {url}")
+        """Procesa un hilo del foro y descarga todos los archivos multimedia"""
+        logger.info(f"Iniciando el procesamiento del hilo: {url}")
         
         if not url.startswith(('http://', 'https://')):
-            url = f"https://simpcity.su/{url.lstrip('/')}"
-            logger.info(f"Converted URL to: {url}")
+            url = f"https://www.simpcity.su/{url.lstrip('/')}"
+            logger.info(f"URL convertida a: {url}")
         
         thread_url = URL(url)
         current_url = thread_url
         
-        # Check if login is required
-        logger.info("Checking if login is required...")
+        # Verificar si es necesario login
+        logger.info("Verificando si es necesario iniciar sesión...")
         if await self.check_login_required(str(current_url)):
             if not await self.prompt_and_login():
-                logger.error("Login required but authentication failed")
+                logger.error("Se requiere login pero la autenticación falló")
                 return
         
-        # Create subfolder based on thread title
-        logger.info("Fetching thread page...")
+        # Una vez logueados, redirigimos al hilo solicitado
+        logger.info("Obteniendo la página del hilo...")
         soup = await self.get_page(current_url)
         if not soup:
-            logger.error("Failed to get thread page")
+            logger.error("Error al obtener la página del hilo")
             return
             
         title_elem = soup.select_one(self.title_selector)
         if not title_elem:
-            logger.error("Could not find thread title")
+            logger.error("No se encontró el título del hilo")
             return
             
         thread_title = re.sub(r'[<>:"/\\|?*]', '_', title_elem.text.strip())
-        logger.info(f"Processing thread: {thread_title}")
+        logger.info(f"Procesando hilo: {thread_title}")
         
         page_num = 1
         total_files = 0
         
         while True:
-            logger.info(f"Processing page {page_num}")
+            logger.info(f"Procesando página {page_num}")
             soup = await self.get_page(current_url)
             if not soup:
-                logger.error(f"Failed to get page {page_num}")
+                logger.error(f"Error al obtener la página {page_num}")
                 break
             
-            # Process each post
+            # Procesar cada post
             posts = soup.select(self.posts_selector)
             if not posts:
-                logger.warning(f"No posts found on page {page_num}")
+                logger.warning(f"No se encontraron posts en la página {page_num}")
                 break
                 
-            logger.info(f"Found {len(posts)} posts on page {page_num}")
+            logger.info(f"Se encontraron {len(posts)} posts en la página {page_num}")
             
             for post_index, post in enumerate(posts, 1):
-                logger.info(f"Processing post {post_index}/{len(posts)} on page {page_num}")
+                logger.info(f"Procesando post {post_index}/{len(posts)} en la página {page_num}")
                 post_content = post.select_one(self.post_content_selector)
                 if post_content:
                     files = await self.process_post(post_content, thread_title)
                     if files:
-                        logger.info(f"Found {len(files)} files in post {post_index}")
+                        logger.info(f"Se encontraron {len(files)} archivos en el post {post_index}")
                         for file_url, filename in files:
                             if await self.download_file(file_url, filename, thread_title):
                                 total_files += 1
                 else:
-                    logger.warning(f"No content found in post {post_index}")
+                    logger.warning(f"No se encontró contenido en el post {post_index}")
             
-            # Check for next page
+            # Verificar si hay siguiente página
             next_page = soup.select_one(self.next_page_selector)
             if next_page and (href := next_page.get('href')):
                 if href.startswith('/'):
                     current_url = self.base_url / href[1:]
                 else:
                     current_url = URL(href)
-                logger.info(f"Moving to page {page_num + 1}: {current_url}")
+                logger.info(f"Pasando a la página {page_num + 1}: {current_url}")
                 page_num += 1
             else:
-                logger.info("No more pages found")
+                logger.info("No se encontraron más páginas")
                 break
         
         if total_files > 0:
-            logger.info(f"Thread processing complete. Downloaded {total_files} files.")
+            logger.info(f"Procesamiento del hilo completado. Se descargaron {total_files} archivos.")
         else:
-            logger.warning("No files were downloaded from this thread.")
+            logger.warning("No se descargó ningún archivo de este hilo.")
 
 async def main():
     if len(sys.argv) != 2:
-        print("Usage: python simpcity.py <thread_url>")
-        print("Example: python simpcity.py https://simpcity.su/threads/thread-title.12345")
+        print("Uso: python simpcity.py <thread_url>")
+        print("Ejemplo: python simpcity.py https://www.simpcity.su/threads/thread-title.12345")
         return
     
     url = sys.argv[1]
     downloader = SimpCityDownloader()
     
     try:
-        # Set a timeout for the entire process
+        # Timeout para el proceso completo (1 hora)
         timeout = 3600  # 1 hour timeout
         async with asyncio.timeout(timeout):
             await downloader.init_session()
             await downloader.process_thread(url)
             
     except asyncio.TimeoutError:
-        logger.error(f"Operation timed out after {timeout} seconds")
+        logger.error(f"La operación excedió el tiempo límite de {timeout} segundos")
     except KeyboardInterrupt:
-        logger.info("Operation cancelled by user")
+        logger.info("Operación cancelada por el usuario")
     except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
+        logger.error(f"Ocurrió un error: {str(e)}")
     finally:
-        logger.info("Cleaning up...")
+        logger.info("Limpiando recursos...")
         await downloader.close()
-        logger.info("Done!")
+        logger.info("¡Listo!")
 
 if __name__ == "__main__":
     try:
@@ -475,7 +497,6 @@ if __name__ == "__main__":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nOperation cancelled by user")
+        print("\nOperación cancelada por el usuario")
     except Exception as e:
-        print(f"\nFatal error: {str(e)}")
-
+        print(f"\nError fatal: {str(e)}")
