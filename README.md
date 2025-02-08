@@ -46,7 +46,7 @@ This Python script downloads media files (images, videos, attachments) from a sp
 
 ```bash
 python simpcity.py https://simpcity.su/threads/user/
-
+```
 ## Support My Work
 
 If you find this tool helpful, please consider supporting my efforts:
